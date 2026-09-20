@@ -1,0 +1,14 @@
+{
+  "name": "rag-agent",
+  "version": "1.0.0",
+  "description": "Answers questions grounded in ingested documents using hybrid retrieval (dense + sparse RRF fusion, MMR, cross-encoder reranking) over parent-child chunked content in Weaviate. Reports RAGAS evaluation scores and a sufficient_context flag per response.",
+  "skills": [
+    {
+      "id": "answer_from_knowledge_base",
+      "name": "Answer from knowledge base",
+      "description": "Retrieve relevant context and generate a grounded answer to a natural-language question."
+    }
+  ],
+  "input_modes": ["text"],
+  "output_modes": ["text", "json"]
+}

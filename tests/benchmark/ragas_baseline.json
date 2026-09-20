@@ -1,0 +1,6 @@
+{
+  "_note": "Placeholder baseline. Run `python tests/benchmark/update_baseline.py --confirm` against a real Weaviate + LLM to generate actual baseline numbers before relying on this for regression checks.",
+  "faithfulness": 0.85,
+  "answer_relevancy": 0.85,
+  "context_precision": 0.80
+}

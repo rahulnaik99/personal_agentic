@@ -1,0 +1,75 @@
+// A2A-inspired agent service contract.
+//
+// Every agent (RAG, tool) implements this same service. The orchestrator
+// is the only gRPC client. Task semantics loosely follow the A2A task
+// lifecycle (submitted -> working -> completed/failed), simplified to a
+// single unary call plus a streaming variant for progress events.
+
+syntax = "proto3";
+
+package agentic.a2a.v1;
+
+// ---- Agent Card (discovery / capability description) ----
+
+message Skill {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+}
+
+message AgentCard {
+  string name = 1;
+  string version = 2;
+  string description = 3;
+  repeated Skill skills = 4;
+  repeated string input_modes = 5;   // e.g. "text"
+  repeated string output_modes = 6;  // e.g. "text", "json"
+}
+
+message GetAgentCardRequest {}
+
+// ---- Task lifecycle ----
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_SUBMITTED = 1;
+  TASK_STATE_WORKING = 2;
+  TASK_STATE_COMPLETED = 3;
+  TASK_STATE_FAILED = 4;
+}
+
+message TaskEvent {
+  string task_id = 1;
+  TaskState state = 2;
+  string message = 3;   // human-readable progress note, e.g. "retrieving context"
+  int64 timestamp_ms = 4;
+}
+
+message UsageMetadata {
+  int32 input_tokens = 1;
+  int32 output_tokens = 2;
+  string model = 3;
+}
+
+message SendTaskRequest {
+  string task_id = 1;
+  string trace_id = 2;      // propagated end-to-end for structured logging
+  string query = 3;
+  map<string, string> context = 4;  // free-form extra fields (e.g. loop_count)
+}
+
+message SendTaskResponse {
+  string task_id = 1;
+  TaskState state = 2;
+  string result_text = 3;
+  bool sufficient = 4;                 // agent-specific confidence flag (RAG: sufficient_context)
+  map<string, string> metadata = 5;    // e.g. ragas scores (json string), tool calls (json string)
+  repeated UsageMetadata usage = 6;
+  string error = 7;
+}
+
+service AgentService {
+  rpc GetAgentCard(GetAgentCardRequest) returns (AgentCard);
+  rpc SendTask(SendTaskRequest) returns (SendTaskResponse);
+  rpc StreamTask(SendTaskRequest) returns (stream TaskEvent);
+}

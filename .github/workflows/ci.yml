@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_ragas_benchmark:
+        description: "Also run the RAGAS regression benchmark (needs live Weaviate + LLM API key)"
+        type: boolean
+        default: false
+
+jobs:
+  lint-and-unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install weaviate-client==4.7.1 ddgs==9.16.0
+
+      - name: Regenerate gRPC stubs (sanity check the proto still compiles cleanly)
+        run: |
+          pip install grpcio-tools==1.83.1
+          bash scripts/gen_proto.sh
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Unit tests (no live services required)
+        run: PYTHONPATH=. pytest tests/unit -v
+
+  ragas-benchmark:
+    # Only runs when explicitly triggered — needs live Weaviate + a real
+    # LLM API key, so it's never part of the default push/PR pipeline.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_ragas_benchmark
+    runs-on: ubuntu-latest
+
+    services:
+      weaviate:
+        image: cr.weaviate.io/semitechnologies/weaviate:1.26.1
+        ports:
+          - 8080:8080
+          - 50051:50051
+        env:
+          AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+          DEFAULT_VECTORIZER_MODULE: "none"
+          ENABLE_MODULES: ""
+          CLUSTER_HOSTNAME: "node1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check required secret is present
+        run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "ANTHROPIC_API_KEY secret not set — skipping benchmark."
+            exit 1
+          fi
+
+      - name: Install RAG agent dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-common.txt
+          pip install -r rag_agent_service/requirements.txt
+          pip install pytest
+
+      - name: Run RAGAS regression benchmark
+        env:
+          LLM_PROVIDER: anthropic
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WEAVIATE_URL: http://localhost:8080
+          WEAVIATE_GRPC_URL: localhost:50051
+        run: PYTHONPATH=. pytest tests/benchmark/test_ragas_benchmark.py -v

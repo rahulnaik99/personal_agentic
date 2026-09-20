@@ -1,0 +1,14 @@
+line-length = 120
+target-version = "py311"
+
+[lint]
+# E/F: pyflakes + pycodestyle errors (real bugs: unused imports, undefined
+# names, syntax issues). I: import sorting. UP: pyupgrade (modern syntax).
+select = ["E4", "E7", "E9", "F", "I", "UP"]
+
+# Deliberately NOT enabled: BLE (blind-except) and S (bandit security).
+# Several modules intentionally catch broad Exception in fallback paths
+# (vision captioning, PDF table extraction, web page fetching, RAGAS
+# evaluation) so one bad input degrades gracefully instead of crashing
+# the whole ingestion/agent run — that's a design choice, not an
+# oversight, so we don't want lint noise on every instance of it.

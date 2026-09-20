@@ -1,0 +1,20 @@
+[
+  {
+    "source": "benchmark-doc-1",
+    "document_text": "The company's remote work policy allows employees to work from home up to three days per week. Employees must be available on core hours from 10am to 3pm local time. Full-time remote work requires manager approval and is reviewed quarterly.",
+    "question": "How many days per week can employees work from home?",
+    "ground_truth": "Up to three days per week."
+  },
+  {
+    "source": "benchmark-doc-2",
+    "document_text": "Annual leave accrues at 1.5 days per month for full-time employees, capping at 24 days per year. Unused leave up to 5 days may be carried over into the next calendar year; any excess is forfeited.",
+    "question": "How many days of unused annual leave can be carried over to the next year?",
+    "ground_truth": "Up to 5 days."
+  },
+  {
+    "source": "benchmark-doc-3",
+    "document_text": "The Q3 2025 financial report shows total revenue of $4.2M, up 12% from Q2. Cloud services contributed $2.8M, while professional services contributed the remaining $1.4M.",
+    "question": "What was the professional services revenue in Q3 2025?",
+    "ground_truth": "$1.4M."
+  }
+]

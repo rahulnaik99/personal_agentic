@@ -1,0 +1,16 @@
+-r ../requirements-common.txt
+
+fastapi==0.136.1
+uvicorn[standard]==0.44.0
+python-multipart==0.0.20
+sse-starlette==3.3.4
+
+langchain-text-splitters==1.1.2
+weaviate-client==4.7.1
+sentence-transformers==3.0.1
+
+unstructured[pdf]==0.16.11
+pillow==10.4.0
+
+ragas==0.3.1
+datasets==5.0.1

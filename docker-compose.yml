@@ -1,0 +1,76 @@
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.26.1
+    restart: on-failure:0
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
+      PERSISTENCE_DATA_PATH: "/var/lib/weaviate"
+      DEFAULT_VECTORIZER_MODULE: "none"
+      ENABLE_MODULES: ""
+      CLUSTER_HOSTNAME: "node1"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+
+  rag-agent-service:
+    build:
+      context: .
+      dockerfile: rag_agent_service/Dockerfile
+    env_file: .env
+    environment:
+      WEAVIATE_URL: http://weaviate:8080
+      WEAVIATE_GRPC_URL: weaviate:50051
+      RAG_AGENT_GRPC_HOST: 0.0.0.0
+    ports:
+      - "50061:50061"
+      - "8001:8001"
+    volumes:
+      - ingested_images:/srv/data/ingested_images
+    depends_on:
+      - weaviate
+
+  tool-agent-service:
+    build:
+      context: .
+      dockerfile: tool_agent_service/Dockerfile
+    env_file: .env
+    environment:
+      TOOL_AGENT_GRPC_HOST: 0.0.0.0
+    ports:
+      - "50062:50062"
+
+  orchestrator-service:
+    build:
+      context: .
+      dockerfile: orchestrator_service/Dockerfile
+    env_file: .env
+    environment:
+      RAG_AGENT_GRPC_HOST: rag-agent-service
+      RAG_AGENT_INGEST_URL: http://rag-agent-service:8001
+      TOOL_AGENT_GRPC_HOST: tool-agent-service
+      API_HOST: "0.0.0.0"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - rag-agent-service
+      - tool-agent-service
+
+  streamlit-ui:
+    build:
+      context: .
+      dockerfile: streamlit_app/Dockerfile
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator-service:8000
+      RAG_INGEST_URL: http://rag-agent-service:8001
+    ports:
+      - "8501:8501"
+    depends_on:
+      - orchestrator-service
+      - rag-agent-service
+
+volumes:
+  weaviate_data:
+  ingested_images:

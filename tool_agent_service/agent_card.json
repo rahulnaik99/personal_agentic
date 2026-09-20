@@ -1,0 +1,19 @@
+{
+  "name": "tool-agent",
+  "version": "1.0.0",
+  "description": "Answers questions requiring current or external information using free web search (DuckDuckGo) and URL content fetching. Every proposed tool call is validated (schema + domain allow-list) before execution.",
+  "skills": [
+    {
+      "id": "web_search",
+      "name": "Web search",
+      "description": "Search the web for current information relevant to a query."
+    },
+    {
+      "id": "fetch_url",
+      "name": "Fetch URL",
+      "description": "Fetch and extract readable text content from a specific URL."
+    }
+  ],
+  "input_modes": ["text"],
+  "output_modes": ["text", "json"]
+}

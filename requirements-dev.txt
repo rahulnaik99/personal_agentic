@@ -1,0 +1,13 @@
+-r requirements-common.txt
+
+pytest==8.3.3
+pytest-mock==3.14.0
+ruff==0.7.4
+
+# unit tests mock out weaviate/ragas/etc, but a couple of pure-logic
+# modules import these at module load time, so they're needed even for
+# the mocked unit test run
+fastapi==0.136.1
+sse-starlette==3.3.4
+langgraph==1.2.11
+langchain-text-splitters==1.1.2

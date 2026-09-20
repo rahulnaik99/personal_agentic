@@ -1,0 +1,7 @@
+-r ../requirements-common.txt
+
+fastapi==0.136.1
+uvicorn[standard]==0.44.0
+sse-starlette==3.3.4
+langgraph==1.2.11
+httpx==0.27.0
