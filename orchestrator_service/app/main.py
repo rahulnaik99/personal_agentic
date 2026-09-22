@@ -103,25 +103,53 @@ def _build_response_payload(query: str, final_state: dict, trace_id: str) -> dic
     }
 
 
-async def _event_stream(query: str, trace_id: str, model_override: dict | None = None):
+async def _event_stream(query: str, trace_id: str, model_override: dict | None = None, conversation_history: list[dict[str, str]] | None = None):
     set_trace_id(trace_id)
     start_trace_collector()
-    initial_state = {"query": query, "trace_id": trace_id, "loop_count": 0, "model_override": model_override}
+    initial_state = {
+        "query": query,
+        "trace_id": trace_id,
+        "loop_count": 0,
+        "model_override": model_override,
+        "conversation_history": conversation_history or [],
+    }
 
-    final_state: dict = {}
-    async for event in compiled_graph.astream_events(initial_state, version="v2"):
-        kind = event.get("event")
-        node_name = event.get("name")
+    final_state: dict = dict(initial_state)
 
-        if kind == "on_chain_start" and node_name in NODE_LABELS:
-            yield {"event": "progress", "data": json.dumps({"node": node_name, "label": NODE_LABELS[node_name]})}
+    try:
+        async for event in compiled_graph.astream_events(initial_state, version="v2"):
+            kind = event.get("event")
+            node_name = event.get("name")
 
-        if kind == "on_chain_end" and node_name == "finalize":
-            output = event.get("data", {}).get("output", {})
-            if isinstance(output, dict):
-                final_state.update(output)
+            if kind == "on_chain_start" and node_name in NODE_LABELS:
+                yield {
+                    "event": "progress",
+                    "data": json.dumps({"node": node_name, "label": NODE_LABELS[node_name]}),
+                }
+
+            # IMPORTANT: a LangGraph `on_chain_end` event for `finalize` only
+            # contains that node's update. The previous implementation kept
+            # only finalize's output, which discarded `route`, `rag_result`,
+            # `tool_result`, and routing metadata. That made the UI/logs look
+            # as if the other agents had not been invoked even when they had.
+            if kind == "on_chain_end" and node_name in NODE_LABELS:
+                output = event.get("data", {}).get("output", {})
+                if isinstance(output, dict):
+                    final_state.update(output)
+    except Exception as exc:
+        # Do not silently return a blank SSE stream. Convert orchestration
+        # failures into a normal final answer so the UI can display them.
+        final_state = {
+            **initial_state,
+            "route": final_state.get("route", "direct"),
+            "final_answer": f"The request could not be completed: {exc}",
+            "output_guardrail_passed": False,
+            "output_guardrail_flags": ["orchestration_error"],
+        }
 
     if "final_answer" not in final_state:
+        # This should only be a defensive fallback for unusual LangGraph
+        # event-stream behavior. It prevents an empty SSE response.
         final_state = await compiled_graph.ainvoke(initial_state)
 
     yield {"event": "done", "data": json.dumps(_build_response_payload(query, final_state, trace_id))}
@@ -131,7 +159,7 @@ async def _event_stream(query: str, trace_id: str, model_override: dict | None =
 async def chat_stream(request: ChatRequest):
     trace_id = request.session_id or str(uuid.uuid4())
     override = request.model_override.model_dump() if request.model_override else None
-    return EventSourceResponse(_event_stream(request.query, trace_id, override))
+    return EventSourceResponse(_event_stream(request.query, trace_id, override, request.conversation_history))
 
 
 @router.post("", response_model=ChatResponse)
@@ -141,7 +169,11 @@ async def chat(request: ChatRequest):
     start_trace_collector()
     override = request.model_override.model_dump() if request.model_override else None
     result = await compiled_graph.ainvoke({
-        "query": request.query, "trace_id": trace_id, "loop_count": 0, "model_override": override,
+        "query": request.query,
+        "trace_id": trace_id,
+        "loop_count": 0,
+        "model_override": override,
+        "conversation_history": request.conversation_history,
     })
     return _build_response_payload(request.query, result, trace_id)
 

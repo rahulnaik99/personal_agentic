@@ -3,24 +3,162 @@ Hybrid retriever pipeline (dense + sparse -> manual RRF -> MMR ->
 cross-encoder rerank -> parent expansion), now carrying element_type
 through so generation can render tables/images differently from prose.
 """
+from __future__ import annotations
+
 from dataclasses import dataclass
 
+import json
+
 import numpy as np
-from weaviate.classes.query import Filter, MetadataQuery
+from weaviate.classes.query import Filter
 
 from shared.core.config import get_settings
 from shared.core.logging import log_step
 from shared.services.encoder_llm import get_encoder, get_reranker
-from shared.vectorstore.weaviate_client import get_weaviate_client
+from shared.vectorstore.weaviate_client import (
+    _graphql_escape,
+    _graphql_request,
+    get_weaviate_client,
+)
 
 
 def _active_filter(category: str | None):
-    """Only active chunks are ever retrievable; optionally narrowed to one
-    category (see agent.py's classify_category()). Filters are AND'd."""
-    f = Filter.by_property("is_active").equal(True)
+    """Build the non-boolean part of the client filter.
+
+    Weaviate Python client 4.7.1 has a boolean-filter serialization bug.
+    Dense/sparse retrieval therefore uses GraphQL below, where
+    ``valueBoolean: true`` is explicit.
+    """
     if category:
-        f = f & Filter.by_property("category").equal(category)
-    return f
+        return Filter.by_property("category").equal(category)
+    return None
+
+
+def _where_clause(category: str | None) -> str:
+    """Return a GraphQL where expression that always enforces is_active=true."""
+    active = '''
+      path: ["is_active"]
+      operator: Equal
+      valueBoolean: true
+    '''
+
+    if not category:
+        return "{ " + active + " }"
+
+    category_value = _graphql_escape(category)
+    return f'''{{
+      operator: And
+      operands: [
+        {{ {active} }},
+        {{
+          path: ["category"]
+          operator: Equal
+          valueText: "{category_value}"
+        }}
+      ]
+    }}'''
+
+
+def _dense_search_graphql(
+    query_vector: list[float],
+    top_k: int,
+    category: str | None,
+    child_class: str,
+) -> list[RetrievedChunk]:
+    vector_literal = json.dumps(
+        [float(v) for v in query_vector],
+        separators=(",", ":"),
+    )
+    where = _where_clause(category)
+
+    gql = f"""
+    {{
+      Get {{
+        {child_class}(
+          nearVector: {{ vector: {vector_literal} }}
+          where: {where}
+          limit: {int(top_k)}
+        ) {{
+          text
+          parent_id
+          source
+          element_type
+          _additional {{
+            id
+            distance
+          }}
+        }}
+      }}
+    }}
+    """
+
+    data = _graphql_request(gql)
+    rows = data.get("Get", {}).get(child_class, [])
+
+    out: list[RetrievedChunk] = []
+    for obj in rows:
+        additional = obj.get("_additional") or {}
+        distance = float(additional.get("distance") or 1.0)
+        out.append(
+            RetrievedChunk(
+                id=str(additional.get("id")),
+                text=obj.get("text", ""),
+                parent_id=obj.get("parent_id", ""),
+                source=obj.get("source", ""),
+                score=1.0 - distance,
+                element_type=obj.get("element_type", "text"),
+            )
+        )
+    return out
+
+
+def _sparse_search_graphql(
+    query: str,
+    top_k: int,
+    category: str | None,
+    child_class: str,
+) -> list[RetrievedChunk]:
+    query_value = _graphql_escape(query)
+    where = _where_clause(category)
+
+    gql = f"""
+    {{
+      Get {{
+        {child_class}(
+          bm25: {{ query: "{query_value}" }}
+          where: {where}
+          limit: {int(top_k)}
+        ) {{
+          text
+          parent_id
+          source
+          element_type
+          _additional {{
+            id
+            score
+          }}
+        }}
+      }}
+    }}
+    """
+
+    data = _graphql_request(gql)
+    rows = data.get("Get", {}).get(child_class, [])
+
+    out: list[RetrievedChunk] = []
+    for obj in rows:
+        additional = obj.get("_additional") or {}
+        out.append(
+            RetrievedChunk(
+                id=str(additional.get("id")),
+                text=obj.get("text", ""),
+                parent_id=obj.get("parent_id", ""),
+                source=obj.get("source", ""),
+                score=float(additional.get("score") or 0.0),
+                element_type=obj.get("element_type", "text"),
+            )
+        )
+    return out
 
 
 @dataclass
@@ -43,45 +181,28 @@ class RetrievedContext:
 
 def _dense_search(query: str, top_k: int, category: str | None) -> list[RetrievedChunk]:
     settings = get_settings()
-    client = get_weaviate_client()
     encoder = get_encoder()
-    child_collection = client.collections.get(settings.WEAVIATE_CLASS_CHILD)
-
     query_vector = encoder.embed_query(query)
-    res = child_collection.query.near_vector(
-        near_vector=query_vector, limit=top_k, filters=_active_filter(category),
-        return_metadata=MetadataQuery(distance=True),
+
+    # GraphQL explicitly encodes BOOL as valueBoolean, avoiding the
+    # weaviate-client 4.7.1 gRPC bool-filter serialization bug.
+    return _dense_search_graphql(
+        query_vector=query_vector,
+        top_k=top_k,
+        category=category,
+        child_class=settings.WEAVIATE_CLASS_CHILD,
     )
-    out = []
-    for obj in res.objects:
-        distance = obj.metadata.distance if obj.metadata else 1.0
-        similarity = 1.0 - (distance or 0.0)
-        out.append(RetrievedChunk(
-            id=str(obj.uuid), text=obj.properties["text"], parent_id=obj.properties["parent_id"],
-            source=obj.properties["source"], score=similarity,
-            element_type=obj.properties.get("element_type", "text"),
-        ))
-    return out
 
 
 def _sparse_search(query: str, top_k: int, category: str | None) -> list[RetrievedChunk]:
     settings = get_settings()
-    client = get_weaviate_client()
-    child_collection = client.collections.get(settings.WEAVIATE_CLASS_CHILD)
 
-    res = child_collection.query.bm25(
-        query=query, limit=top_k, filters=_active_filter(category),
-        return_metadata=MetadataQuery(score=True),
+    return _sparse_search_graphql(
+        query=query,
+        top_k=top_k,
+        category=category,
+        child_class=settings.WEAVIATE_CLASS_CHILD,
     )
-    out = []
-    for obj in res.objects:
-        score = obj.metadata.score if obj.metadata else 0.0
-        out.append(RetrievedChunk(
-            id=str(obj.uuid), text=obj.properties["text"], parent_id=obj.properties["parent_id"],
-            source=obj.properties["source"], score=score or 0.0,
-            element_type=obj.properties.get("element_type", "text"),
-        ))
-    return out
 
 
 def _reciprocal_rank_fusion(ranked_lists: list[list[RetrievedChunk]], k: int) -> list[RetrievedChunk]:

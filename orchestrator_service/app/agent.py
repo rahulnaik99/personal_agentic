@@ -6,7 +6,7 @@ the AgentService contract, not agent internals.
 """
 from pathlib import Path
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from orchestrator_service.app.grpc_clients import call_rag_agent, call_tool_agent
 from orchestrator_service.app.guardrails import guard_input, guard_output
@@ -35,6 +35,7 @@ def guardrail_input_node(state: GraphState) -> dict:
 
 def classify_intent(state: GraphState) -> dict:
     query = state["query"]
+    history = state.get("conversation_history") or []
     override = state.get("model_override") or {}
     with log_step("classify_intent", agent="orchestrator", query=query) as ctx:
         system_prompt = load_prompt(str(ROUTING_PROMPT_PATH))
@@ -43,17 +44,25 @@ def classify_intent(state: GraphState) -> dict:
             provider_override=override.get("provider"),
             model_override=override.get("model"),
         )
+        history_text = "\n".join(f"{m.get('role', 'user').upper()}: {m.get('content', '')}" for m in history[-8:])
+        routing_input = f"Conversation history:\n{history_text}\n\nCurrent query:\n{query}" if history_text else query
         response = invoke_and_track(
-            llm, [SystemMessage(content=system_prompt), HumanMessage(content=query)],
+            llm, [SystemMessage(content=system_prompt), HumanMessage(content=routing_input)],
             node="classify_intent", agent="orchestrator",
         )
         raw = response.content if isinstance(response.content, str) else str(response.content)
 
         try:
-            cleaned = raw.strip().strip("```").replace("json", "", 1).strip() if raw.strip().startswith("```") else raw.strip()
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.removeprefix("```").removeprefix("json").strip()
+                if cleaned.endswith("```"):
+                    cleaned = cleaned[:-3].strip()
             decision = RouteDecision.model_validate_json(cleaned)
-        except Exception:
-            decision = RouteDecision(route="direct", reason="fallback: routing output was not valid JSON")
+        except Exception as exc:
+            # A routing failure should be visible in traces. Falling back to
+            # direct is safer than guessing a retrieval/tool route.
+            decision = RouteDecision(route="direct", reason=f"routing parse fallback: {type(exc).__name__}")
 
         ctx["output"] = {"route": decision.route}
 
@@ -61,12 +70,12 @@ def classify_intent(state: GraphState) -> dict:
 
 
 def call_rag_node(state: GraphState) -> dict:
-    result = call_rag_agent(state["query"], state["trace_id"], model_override=state.get("model_override"))
+    result = call_rag_agent(state["query"], state["trace_id"], model_override=state.get("model_override"), conversation_history=state.get("conversation_history"))
     return {"rag_result": result}
 
 
 def call_tool_node(state: GraphState) -> dict:
-    result = call_tool_agent(state["query"], state["trace_id"], model_override=state.get("model_override"))
+    result = call_tool_agent(state["query"], state["trace_id"], model_override=state.get("model_override"), conversation_history=state.get("conversation_history"))
     return {"tool_result": result}
 
 
@@ -76,6 +85,7 @@ def increment_loop(state: GraphState) -> dict:
 
 def direct_answer(state: GraphState) -> dict:
     query = state["query"]
+    history = state.get("conversation_history") or []
     override = state.get("model_override") or {}
     with log_step("direct_answer", agent="orchestrator", query=query) as ctx:
         system_prompt = load_prompt(str(DIRECT_ANSWER_PROMPT_PATH))
@@ -83,8 +93,13 @@ def direct_answer(state: GraphState) -> dict:
             provider_override=override.get("provider"),
             model_override=override.get("model"),
         )
+        history_messages = [
+            HumanMessage(content=m["content"]) if m.get("role") == "user" else
+            AIMessage(content=m["content"])
+            for m in history[-8:] if m.get("content")
+        ]
         response = invoke_and_track(
-            llm, [SystemMessage(content=system_prompt), HumanMessage(content=query)],
+            llm, [SystemMessage(content=system_prompt), *history_messages, HumanMessage(content=query)],
             node="direct_answer", agent="orchestrator",
         )
         ctx["output"] = {"len": len(response.content or "")}

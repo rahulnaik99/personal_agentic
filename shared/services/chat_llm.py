@@ -77,6 +77,20 @@ def get_chat_llm(
             max_tokens=max_tokens,
         )
 
+    if provider == "mlx":
+        # mlx-lm exposes an OpenAI-compatible /v1/chat/completions endpoint.
+        # The model name is passed through to the server; the server may use
+        # the HF repo id it was launched with.
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=model or settings.MLX_MODEL_FALLBACK,
+            base_url=settings.MLX_LLM_BASE_URL,
+            api_key=settings.MLX_LLM_API_KEY,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+
     raise ValueError(f"Unknown LLM_PROVIDER: {provider}")
 
 

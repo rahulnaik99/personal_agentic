@@ -3,19 +3,30 @@ Weaviate connection + schema management.
 
 Two collections:
   - ParentChunk: large context blocks, stored for retrieval-time expansion,
-    NOT directly vector-searched (no need — we search children and expand).
-  - ChildChunk:  small chunks, vector-searched (dense) and text-searched
-    (BM25 sparse via Weaviate's inverted index), each carries a
-    `parent_id` reference back to its ParentChunk.
+    NOT directly vector-searched.
+  - ChildChunk: small chunks, vector-searched and text-searched.
 
-We deliberately do NOT use Weaviate's built-in `hybrid()` fused query —
-per project design, dense and sparse are queried separately here and
-fused manually (RRF) in app/agents/rag_agent/retriever.py, so each stage
-(RRF, MMR, rerank) stays independently tunable.
+Dense and sparse retrieval are intentionally performed separately and fused
+manually in the RAG retriever.
+
+IMPORTANT:
+    weaviate-client==4.7.1 has a Boolean-filter serialization problem in
+    query.fetch_objects().
+
+    The schema intentionally keeps:
+        is_active = BOOL
+        category  = TEXT
+
+    Boolean-filtered reads therefore use Weaviate's HTTP GraphQL API with
+    explicit valueBoolean:true/false.
+
+    Writes continue to use the official Weaviate Python client.
 """
+
 from datetime import UTC, datetime
 from functools import lru_cache
 
+import httpx
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
 from weaviate.classes.query import Filter
@@ -23,189 +34,671 @@ from weaviate.classes.query import Filter
 from shared.core.config import get_settings
 
 
+# ============================================================================
+# Weaviate connection
+# ============================================================================
+
 @lru_cache
 def get_weaviate_client() -> weaviate.WeaviateClient:
     settings = get_settings()
+
     client = weaviate.connect_to_local(
         host=_host_from_url(settings.WEAVIATE_URL),
         port=_port_from_url(settings.WEAVIATE_URL),
-        grpc_port=int(settings.WEAVIATE_GRPC_URL.split(":")[-1]),
+        grpc_port=int(
+            settings.WEAVIATE_GRPC_URL.split(":")[-1]
+        ),
     )
+
     return client
 
 
 def _host_from_url(url: str) -> str:
-    return url.split("//")[-1].split(":")[0]
+    return (
+        url.split("//")[-1]
+        .split(":")[0]
+    )
 
 
 def _port_from_url(url: str) -> int:
-    return int(url.split("//")[-1].split(":")[1])
+    return int(
+        url.split("//")[-1]
+        .split(":")[1]
+    )
 
 
-# Properties shared by both collections for versioning/dedup + categorization.
-# Defined once so ParentChunk and ChildChunk can never drift out of sync.
+# ============================================================================
+# GraphQL helpers
+# ============================================================================
+
+def _graphql_escape(value: str) -> str:
+    """
+    Escape a Python string before embedding it in a GraphQL string literal.
+
+    GraphQL strings use JSON-like escaping rules.
+    """
+
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+
+
+def _graphql_request(query: str) -> dict:
+    """
+    Execute a GraphQL request against Weaviate.
+
+    We intentionally use HTTP GraphQL for Boolean-filtered reads because
+    weaviate-client==4.7.1 has a gRPC protobuf serialization issue where:
+
+        valueBoolean=True
+
+    can incorrectly be passed into:
+
+        value_int
+
+    GraphQL lets us explicitly send:
+
+        valueBoolean: true
+    """
+
+    settings = get_settings()
+
+    graphql_url = (
+        f"{settings.WEAVIATE_URL.rstrip('/')}"
+        "/v1/graphql"
+    )
+
+    response = httpx.post(
+        graphql_url,
+        json={"query": query},
+        timeout=30.0,
+    )
+
+    response.raise_for_status()
+
+    payload = response.json()
+
+    if payload.get("errors"):
+        raise RuntimeError(
+            "Weaviate GraphQL error: "
+            f"{payload['errors']}"
+        )
+
+    return payload.get("data", {})
+
+
+# ============================================================================
+# Shared schema properties
+# ============================================================================
+
 _VERSIONING_PROPERTIES = [
-    # User-supplied label (e.g. "profession_doc", "financial_doc") — lets
-    # retrieval filter to the right document category instead of searching
-    # everything. See rag_agent_service/app/agent.py's classify_category().
-    Property(name="category", data_type=DataType.TEXT),
-    # Only active chunks are ever returned by retrieval (see retriever.py's
-    # is_active filter). Re-ingesting the same `source` with changed content
-    # deactivates the old chunks rather than deleting them, so history is
-    # recoverable — see ingestion.py's upsert logic.
-    Property(name="is_active", data_type=DataType.BOOL),
-    Property(name="ingested_at", data_type=DataType.DATE),
-    # SHA-256 of the source content, used to tell "genuine re-ingest of
-    # identical content" (skip) apart from "content actually changed"
-    # (deactivate old, insert new) for the same `source` label.
-    Property(name="content_hash", data_type=DataType.TEXT),
+    Property(
+        name="category",
+        data_type=DataType.TEXT,
+    ),
+    Property(
+        name="is_active",
+        data_type=DataType.BOOL,
+    ),
+    Property(
+        name="ingested_at",
+        data_type=DataType.DATE,
+    ),
+    Property(
+        name="content_hash",
+        data_type=DataType.TEXT,
+    ),
 ]
 
 
+# ============================================================================
+# Schema management
+# ============================================================================
+
 def ensure_schema() -> None:
-    """Idempotently create the Parent/Child collections if missing."""
+    """
+    Idempotently create the Parent/Child collections if missing.
+    """
+
     settings = get_settings()
     client = get_weaviate_client()
 
-    if not client.collections.exists(settings.WEAVIATE_CLASS_PARENT):
+    # ------------------------------------------------------------------------
+    # ParentChunk
+    # ------------------------------------------------------------------------
+
+    if not client.collections.exists(
+        settings.WEAVIATE_CLASS_PARENT
+    ):
         client.collections.create(
             name=settings.WEAVIATE_CLASS_PARENT,
             properties=[
-                Property(name="text", data_type=DataType.TEXT),
-                Property(name="source", data_type=DataType.TEXT),
-                Property(name="metadata_json", data_type=DataType.TEXT),
+                Property(
+                    name="text",
+                    data_type=DataType.TEXT,
+                ),
+                Property(
+                    name="source",
+                    data_type=DataType.TEXT,
+                ),
+                Property(
+                    name="metadata_json",
+                    data_type=DataType.TEXT,
+                ),
                 *_VERSIONING_PROPERTIES,
             ],
-            vectorizer_config=Configure.Vectorizer.none(),  # we supply/skip vectors ourselves
+            vectorizer_config=Configure.Vectorizer.none(),
         )
 
-    if not client.collections.exists(settings.WEAVIATE_CLASS_CHILD):
+    # ------------------------------------------------------------------------
+    # ChildChunk
+    # ------------------------------------------------------------------------
+
+    if not client.collections.exists(
+        settings.WEAVIATE_CLASS_CHILD
+    ):
         client.collections.create(
             name=settings.WEAVIATE_CLASS_CHILD,
             properties=[
-                Property(name="text", data_type=DataType.TEXT),  # BM25 sparse search hits this
-                Property(name="parent_id", data_type=DataType.TEXT),
-                Property(name="source", data_type=DataType.TEXT),
-                Property(name="chunk_index", data_type=DataType.INT),
-                # "text" | "table" | "image" — tables/images are kept as single
-                # unsplit chunks (see rag_agent_service/app/chunking.py) so
-                # generation can treat them specially (render tables verbatim,
-                # etc.) instead of prose-summarizing them.
-                Property(name="element_type", data_type=DataType.TEXT),
-                Property(name="image_path", data_type=DataType.TEXT),  # set only for element_type="image"
+                Property(
+                    name="text",
+                    data_type=DataType.TEXT,
+                ),
+                Property(
+                    name="parent_id",
+                    data_type=DataType.TEXT,
+                ),
+                Property(
+                    name="source",
+                    data_type=DataType.TEXT,
+                ),
+                Property(
+                    name="chunk_index",
+                    data_type=DataType.INT,
+                ),
+                Property(
+                    name="element_type",
+                    data_type=DataType.TEXT,
+                ),
+                Property(
+                    name="image_path",
+                    data_type=DataType.TEXT,
+                ),
                 *_VERSIONING_PROPERTIES,
             ],
-            vectorizer_config=Configure.Vectorizer.none(),  # we supply our own bi-encoder vectors
+            vectorizer_config=Configure.Vectorizer.none(),
         )
 
+
+# ============================================================================
+# Existing application queries
+# ============================================================================
 
 def get_active_categories() -> list[str]:
-    """Distinct categories currently present among active chunks — used by
-    the category classifier prompt to know what it's choosing between."""
+    """
+    Return distinct categories currently present among active ChildChunk
+    objects.
+
+    Uses GraphQL because is_active is a BOOL and weaviate-client 4.7.1
+    fetch_objects() has a Boolean filter serialization issue.
+    """
+
     settings = get_settings()
-    client = get_weaviate_client()
-    child_collection = client.collections.get(settings.WEAVIATE_CLASS_CHILD)
 
-    result = child_collection.aggregate.over_all(
-        filters=Filter.by_property("is_active").equal(True),
-        group_by="category",
+    child_class = settings.WEAVIATE_CLASS_CHILD
+
+    # In Weaviate GraphQL, ``groupBy`` is an argument on the
+    # collection aggregation, while ``groupedBy`` is the response field.
+    query = f"""
+    {{
+      Aggregate {{
+        {child_class}(
+          where: {{
+            path: ["is_active"]
+            operator: Equal
+            valueBoolean: true
+          }}
+          groupBy: ["category"]
+        ) {{
+          groupedBy {{
+            value
+          }}
+        }}
+      }}
+    }}
+    """
+
+
+    data = _graphql_request(query)
+
+    rows = (
+        data
+        .get("Aggregate", {})
+        .get(child_class, [])
     )
-    return sorted({group.grouped_by.value for group in result.groups if group.grouped_by.value})
+
+    categories: set[str] = set()
+
+    for row in rows:
+        grouped_by = row.get("groupedBy") or {}
+        value = grouped_by.get("value")
+
+        if value:
+            categories.add(value)
+
+    return sorted(categories)
 
 
-def get_existing_chunk_hash(source: str) -> str | None:
-    """Returns the content_hash of the currently-active chunks for a given
-    `source`, or None if nothing active exists for it yet. Used by
-    ingestion.py to decide: first ingest / unchanged duplicate / real update."""
+# ============================================================================
+# Duplicate detection
+# ============================================================================
+
+def get_existing_chunk_hash(
+    source: str,
+) -> str | None:
+    """
+    Return the content_hash of the currently-active ParentChunk for a source.
+
+    IMPORTANT:
+        Do NOT use:
+
+            collection.query.fetch_objects(
+                filters=Filter.by_property(
+                    "is_active"
+                ).equal(True)
+            )
+
+        with weaviate-client==4.7.1.
+
+    Instead, Boolean filtering is performed through GraphQL.
+    """
+
     settings = get_settings()
-    client = get_weaviate_client()
-    parent_collection = client.collections.get(settings.WEAVIATE_CLASS_PARENT)
 
-    result = parent_collection.query.fetch_objects(
-        filters=Filter.by_property("source").equal(source) & Filter.by_property("is_active").equal(True),
-        limit=1,
+    parent_class = settings.WEAVIATE_CLASS_PARENT
+
+    escaped_source = _graphql_escape(source)
+
+    query = f"""
+    {{
+      Get {{
+        {parent_class}(
+          where: {{
+            operator: And
+            operands: [
+              {{
+                path: ["source"]
+                operator: Equal
+                valueText: "{escaped_source}"
+              }}
+              {{
+                path: ["is_active"]
+                operator: Equal
+                valueBoolean: true
+              }}
+            ]
+          }}
+          limit: 1
+        ) {{
+          source
+          content_hash
+          is_active
+        }}
+      }}
+    }}
+    """
+
+    data = _graphql_request(query)
+
+    objects = (
+        data
+        .get("Get", {})
+        .get(parent_class, [])
     )
-    if not result.objects:
+
+    if not objects:
         return None
-    return result.objects[0].properties.get("content_hash")
+
+    return objects[0].get("content_hash")
 
 
-def deactivate_source(source: str) -> int:
-    """Marks every active parent+child chunk for a given `source` as
-    inactive (never deleted, so history stays recoverable). Returns the
-    number of objects deactivated."""
+# ============================================================================
+# Source deactivation
+# ============================================================================
+
+def _get_active_objects_by_source(
+    collection_name: str,
+    source: str,
+) -> list[dict]:
+    """
+    Return active objects matching a source.
+
+    Only the properties needed for deactivation are retrieved.
+
+    GraphQL is used to avoid the weaviate-client 4.7.1 Boolean-filter bug.
+    """
+
+    escaped_source = _graphql_escape(source)
+
+    query = f"""
+    {{
+      Get {{
+        {collection_name}(
+          where: {{
+            operator: And
+            operands: [
+              {{
+                path: ["source"]
+                operator: Equal
+                valueText: "{escaped_source}"
+              }}
+              {{
+                path: ["is_active"]
+                operator: Equal
+                valueBoolean: true
+              }}
+            ]
+          }}
+          limit: 10000
+        ) {{
+          _additional {{
+            id
+          }}
+          source
+          is_active
+        }}
+      }}
+    }}
+    """
+
+    data = _graphql_request(query)
+
+    return (
+        data
+        .get("Get", {})
+        .get(collection_name, [])
+    )
+
+
+def deactivate_source(
+    source: str,
+) -> int:
+    """
+    Mark every active parent/child chunk for a source as inactive.
+
+    Reads are performed through GraphQL because of the Boolean-filter issue
+    in weaviate-client 4.7.1.
+
+    Updates are still performed using the normal Weaviate Python client.
+    """
+
     settings = get_settings()
     client = get_weaviate_client()
+
     deactivated = 0
 
-    for class_name in (settings.WEAVIATE_CLASS_PARENT, settings.WEAVIATE_CLASS_CHILD):
-        collection = client.collections.get(class_name)
-        result = collection.query.fetch_objects(
-            filters=Filter.by_property("source").equal(source) & Filter.by_property("is_active").equal(True),
-            limit=10_000,
+    for class_name in (
+        settings.WEAVIATE_CLASS_PARENT,
+        settings.WEAVIATE_CLASS_CHILD,
+    ):
+
+        collection = client.collections.get(
+            class_name
         )
-        for obj in result.objects:
-            collection.data.update(uuid=obj.uuid, properties={"is_active": False})
+
+        objects = _get_active_objects_by_source(
+            class_name,
+            source,
+        )
+
+        for obj in objects:
+
+            additional = (
+                obj.get("_additional")
+                or {}
+            )
+
+            uuid = additional.get("id")
+
+            if not uuid:
+                continue
+
+            collection.data.update(
+                uuid=uuid,
+                properties={
+                    "is_active": False,
+                },
+            )
+
             deactivated += 1
 
     return deactivated
 
 
+# ============================================================================
+# Dashboard statistics
+# ============================================================================
+
+def _graphql_count(
+    collection_name: str,
+    is_active: bool,
+) -> int:
+    """
+    Count objects using an explicit GraphQL Boolean filter.
+    """
+
+    value = (
+        "true"
+        if is_active
+        else "false"
+    )
+
+    query = f"""
+    {{
+      Aggregate {{
+        {collection_name}(
+          where: {{
+            path: ["is_active"]
+            operator: Equal
+            valueBoolean: {value}
+          }}
+        ) {{
+          meta {{
+            count
+          }}
+        }}
+      }}
+    }}
+    """
+
+    data = _graphql_request(query)
+
+    rows = (
+        data
+        .get("Aggregate", {})
+        .get(collection_name, [])
+    )
+
+    if not rows:
+        return 0
+
+    return (
+        rows[0]
+        .get("meta", {})
+        .get("count", 0)
+        or 0
+    )
+
+
+def _get_active_parent_sources() -> list[dict]:
+    """
+    Fetch active ParentChunk category/source pairs.
+
+    Uses HTTP GraphQL instead of client 4.7.1's gRPC fetch_objects Boolean
+    filter serialization path.
+    """
+
+    settings = get_settings()
+    parent_class = settings.WEAVIATE_CLASS_PARENT
+
+    query = f"""
+    {{
+      Get {{
+        {parent_class}(
+          where: {{
+            path: ["is_active"]
+            operator: Equal
+            valueBoolean: true
+          }}
+          limit: 10000
+        ) {{
+          category
+          source
+        }}
+      }}
+    }}
+    """
+
+    data = _graphql_request(query)
+
+    return (
+        data
+        .get("Get", {})
+        .get(parent_class, [])
+    )
+
+
 def get_ingestion_stats() -> dict:
     """
-    Powers the Streamlit ingestion dashboard: total object counts, a
-    category -> distinct-file-count breakdown, and active/inactive chunk
-    counts. Aggregate counts use Weaviate's native aggregate API (cheap);
-    the per-category file breakdown fetches active parent objects and
-    counts distinct `source` values in Python, since Weaviate's group-by
-    aggregate counts objects, not distinct property values — fine at the
-    scale this project targets, but would need a different approach
-    (e.g. a maintained counter) at very large corpus sizes.
+    Powers the Streamlit ingestion dashboard.
+
+    Returns:
+      - total object count
+      - active/inactive ChildChunk counts
+      - active/inactive ParentChunk counts
+      - active embedding count
+      - distinct files by category
+      - total distinct files
+
+    is_active remains BOOL.
+    category remains TEXT.
     """
+
     settings = get_settings()
-    client = get_weaviate_client()
-    parent_collection = client.collections.get(settings.WEAVIATE_CLASS_PARENT)
-    child_collection = client.collections.get(settings.WEAVIATE_CLASS_CHILD)
 
-    def _count(collection, is_active: bool) -> int:
-        result = collection.aggregate.over_all(
-            filters=Filter.by_property("is_active").equal(is_active), total_count=True,
-        )
-        return result.total_count or 0
+    ensure_schema()
 
-    total_chunks_active = _count(child_collection, True)
-    total_chunks_inactive = _count(child_collection, False)
-    total_parents_active = _count(parent_collection, True)
-    total_parents_inactive = _count(parent_collection, False)
+    # ------------------------------------------------------------------------
+    # Child counts
+    # ------------------------------------------------------------------------
 
-    sources_by_category: dict[str, set] = {}
-    result = parent_collection.query.fetch_objects(
-        filters=Filter.by_property("is_active").equal(True),
-        limit=10_000,
-        return_properties=["category", "source"],
+    total_chunks_active = _graphql_count(
+        settings.WEAVIATE_CLASS_CHILD,
+        True,
     )
-    for obj in result.objects:
-        category = obj.properties.get("category") or "uncategorized"
-        source = obj.properties.get("source")
+
+    total_chunks_inactive = _graphql_count(
+        settings.WEAVIATE_CLASS_CHILD,
+        False,
+    )
+
+    # ------------------------------------------------------------------------
+    # Parent counts
+    # ------------------------------------------------------------------------
+
+    total_parents_active = _graphql_count(
+        settings.WEAVIATE_CLASS_PARENT,
+        True,
+    )
+
+    total_parents_inactive = _graphql_count(
+        settings.WEAVIATE_CLASS_PARENT,
+        False,
+    )
+
+    # ------------------------------------------------------------------------
+    # Category -> distinct source/file count
+    # ------------------------------------------------------------------------
+
+    sources_by_category: dict[
+        str,
+        set[str],
+    ] = {}
+
+    active_parents = (
+        _get_active_parent_sources()
+    )
+
+    for obj in active_parents:
+
+        category = (
+            obj.get("category")
+            or "uncategorized"
+        )
+
+        source = obj.get("source")
+
         if source:
-            sources_by_category.setdefault(category, set()).add(source)
 
-    category_file_counts = {category: len(sources) for category, sources in sources_by_category.items()}
+            sources_by_category.setdefault(
+                category,
+                set(),
+            ).add(source)
 
-    return {
-        "total_objects": total_chunks_active + total_chunks_inactive + total_parents_active + total_parents_inactive,
-        "total_chunks_active": total_chunks_active,
-        "total_chunks_inactive": total_chunks_inactive,
-        "total_embeddings_active": total_chunks_active,  # every active child chunk carries a vector
-        "total_files_by_category": category_file_counts,
-        "total_files": sum(category_file_counts.values()),
+    category_file_counts = {
+        category: len(sources)
+        for category, sources
+        in sources_by_category.items()
     }
 
+    # ------------------------------------------------------------------------
+    # Final response
+    # ------------------------------------------------------------------------
+
+    return {
+        "total_objects": (
+            total_chunks_active
+            + total_chunks_inactive
+            + total_parents_active
+            + total_parents_inactive
+        ),
+        "total_chunks_active": (
+            total_chunks_active
+        ),
+        "total_chunks_inactive": (
+            total_chunks_inactive
+        ),
+        "total_embeddings_active": (
+            total_chunks_active
+        ),
+        "total_files_by_category": (
+            category_file_counts
+        ),
+        "total_files": (
+            sum(
+                category_file_counts.values()
+            )
+        ),
+    }
+
+
+# ============================================================================
+# Utilities
+# ============================================================================
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
 def close_client() -> None:
+    """
+    Close the cached Weaviate connection.
+    """
+
     client = get_weaviate_client()
     client.close()

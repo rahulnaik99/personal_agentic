@@ -45,7 +45,7 @@ flowchart LR
     INGEST --> WEAVIATE
     TOOLAGENT -- "DuckDuckGo search,\nhttpx fetch" --> WEB(["Public internet"])
 
-    RAGAGENT -.->|"multi-provider LLM calls"| LLM[("Anthropic / OpenAI /\nlocal model server")]
+    RAGAGENT -.->|"multi-provider LLM calls"| LLM[("Anthropic / OpenAI /\nOllama / MLX local model server")]
     TOOLAGENT -.-> LLM
     GRAPH -.-> LLM
 ```
@@ -110,7 +110,7 @@ orchestrator/RAG-agent "back and forth" loop, bounded by `MAX_LOOPS`.
 | Guardrails | Regex-based PII/injection detection + length limits on every input; PII redaction (or block) on every output | `shared/core/guardrails.py`, wrapped per-service in each `guardrails.py` |
 | Prompts | Every LLM-facing prompt lives in a `.md` file (Role/Instructions/Output Format/Few-Shot Examples), loaded once and cached | `shared/core/prompts.py` (`load_prompt`), `*/app/prompts/*.md` |
 | Config | All tunables (models, retrieval params, ports, guardrail thresholds) come from `.env` via one `Settings` object | `shared/core/config.py` |
-| Multi-provider LLM | One factory function picks Anthropic/OpenAI/local based on `LLM_PROVIDER` | `shared/services/chat_llm.py` |
+| Multi-provider LLM | One factory function picks Anthropic/OpenAI/local/MLX based on `LLM_PROVIDER` | `shared/services/chat_llm.py` |
 
 ---
 

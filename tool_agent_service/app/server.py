@@ -40,7 +40,14 @@ class ToolAgentServicer(agent_pb2_grpc.AgentServiceServicer):
         model_override = {"provider": model_provider, "model": request.context.get("model_name") or None} \
             if model_provider else None
         try:
-            result = run_tool_agent(query=request.query, trace_id=request.trace_id, model_override=model_override)
+            conversation_history = json.loads(request.context.get("conversation_history", "[]"))
+        except json.JSONDecodeError:
+            conversation_history = []
+        try:
+            result = run_tool_agent(
+                query=request.query, trace_id=request.trace_id,
+                model_override=model_override, conversation_history=conversation_history,
+            )
         except Exception as exc:
             logging.getLogger("tool_agent.server").exception("SendTask failed")
             return agent_pb2.SendTaskResponse(

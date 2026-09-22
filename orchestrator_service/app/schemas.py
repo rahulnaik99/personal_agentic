@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 
 class ModelOverride(BaseModel):
-    provider: Literal["local", "openai", "anthropic"]
+    provider: Literal["local", "mlx", "openai", "anthropic"]
     model: str | None = None
 
 
@@ -19,6 +19,7 @@ class GraphState(TypedDict, total=False):
     query: str
     trace_id: str
     model_override: dict[str, Any] | None
+    conversation_history: list[dict[str, str]]
 
     route: str
     routing_reason: str
@@ -38,6 +39,7 @@ class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1)
     session_id: str | None = None
     model_override: ModelOverride | None = None
+    conversation_history: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ChatResponse(BaseModel):

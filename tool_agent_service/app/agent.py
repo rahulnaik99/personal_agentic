@@ -31,7 +31,7 @@ def fetch_url(url: str) -> str:
     return ""  # schema only
 
 
-def run_tool_agent(query: str, trace_id: str, model_override: dict | None = None) -> dict:
+def run_tool_agent(query: str, trace_id: str, model_override: dict | None = None, conversation_history: list[dict[str, str]] | None = None) -> dict:
     """
     model_override: {"provider": ..., "model": ...} — lets a caller (the
     Streamlit UI's model selector, via the orchestrator) switch LLM
@@ -61,7 +61,13 @@ def run_tool_agent(query: str, trace_id: str, model_override: dict | None = None
         provider_override=override.get("provider"),
         model_override=override.get("model"),
     ).bind_tools([web_search, fetch_url])
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=query)]
+    history_messages = [
+        HumanMessage(content=m["content"]) if m.get("role") == "user" else
+        AIMessage(content=m["content"])
+        for m in (conversation_history or [])[-8:]
+        if m.get("content")
+    ]
+    messages = [SystemMessage(content=system_prompt), *history_messages, HumanMessage(content=query)]
     tool_calls_made = []
 
     with log_step("run_tool_agent", agent="tool_agent", query=query) as ctx:

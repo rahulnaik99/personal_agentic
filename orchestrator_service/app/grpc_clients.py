@@ -13,7 +13,7 @@ import uuid
 import grpc
 
 from shared.core.config import get_settings
-from shared.core.logging import StepRecord, get_trace_collector
+from shared.core.logging import StepRecord, get_trace_collector, log_step
 from shared.core.pricing import estimate_cost_usd
 from shared.generated import agent_pb2, agent_pb2_grpc
 
@@ -33,7 +33,7 @@ def _record_remote_steps(node: str, agent: str, latency_ms: float, usage_list) -
         ))
 
 
-def _build_context(category: str | None = None, model_override: dict | None = None) -> dict[str, str]:
+def _build_context(category: str | None = None, model_override: dict | None = None, conversation_history: list[dict[str, str]] | None = None) -> dict[str, str]:
     """
     Builds the gRPC SendTaskRequest.context map (string->string only, per
     the proto). model_override is {"provider": ..., "model": ...} from
@@ -43,6 +43,8 @@ def _build_context(category: str | None = None, model_override: dict | None = No
     context: dict[str, str] = {}
     if category:
         context["category"] = category
+    if conversation_history:
+        context["conversation_history"] = json.dumps(conversation_history, ensure_ascii=False)
     if model_override:
         if model_override.get("provider"):
             context["model_provider"] = model_override["provider"]
@@ -54,20 +56,23 @@ def _build_context(category: str | None = None, model_override: dict | None = No
 def call_rag_agent(
     query: str, trace_id: str, category: str | None = None,
     model_override: dict | None = None, timeout: int | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> dict:
     settings = get_settings()
     address = f"{settings.RAG_AGENT_GRPC_HOST}:{settings.RAG_AGENT_GRPC_PORT}"
     task_id = str(uuid.uuid4())
-    request_context = _build_context(category, model_override)
+    request_context = _build_context(category, model_override, conversation_history)
 
-    start = time.perf_counter()
-    with grpc.insecure_channel(address) as channel:
-        stub = agent_pb2_grpc.AgentServiceStub(channel)
-        request = agent_pb2.SendTaskRequest(
-            task_id=task_id, trace_id=trace_id, query=query, context=request_context,
-        )
-        response = stub.SendTask(request, timeout=timeout or settings.GRPC_CALL_TIMEOUT_SECONDS)
-    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+    with log_step("dispatch_rag_agent", agent="orchestrator", query=query, address=address) as ctx:
+        start = time.perf_counter()
+        with grpc.insecure_channel(address) as channel:
+            stub = agent_pb2_grpc.AgentServiceStub(channel)
+            request = agent_pb2.SendTaskRequest(
+                task_id=task_id, trace_id=trace_id, query=query, context=request_context,
+            )
+            response = stub.SendTask(request, timeout=timeout or settings.GRPC_CALL_TIMEOUT_SECONDS)
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        ctx["output"] = {"state": response.state, "error": response.error or None}
 
     _record_remote_steps("rag_agent_call", "rag_agent", latency_ms, response.usage)
 
@@ -86,20 +91,22 @@ def call_rag_agent(
     }
 
 
-def call_tool_agent(query: str, trace_id: str, model_override: dict | None = None, timeout: int | None = None) -> dict:
+def call_tool_agent(query: str, trace_id: str, model_override: dict | None = None, timeout: int | None = None, conversation_history: list[dict[str, str]] | None = None) -> dict:
     settings = get_settings()
     address = f"{settings.TOOL_AGENT_GRPC_HOST}:{settings.TOOL_AGENT_GRPC_PORT}"
     task_id = str(uuid.uuid4())
-    request_context = _build_context(model_override=model_override)
+    request_context = _build_context(model_override=model_override, conversation_history=conversation_history)
 
-    start = time.perf_counter()
-    with grpc.insecure_channel(address) as channel:
-        stub = agent_pb2_grpc.AgentServiceStub(channel)
-        request = agent_pb2.SendTaskRequest(
-            task_id=task_id, trace_id=trace_id, query=query, context=request_context,
-        )
-        response = stub.SendTask(request, timeout=timeout or settings.GRPC_CALL_TIMEOUT_SECONDS)
-    latency_ms = round((time.perf_counter() - start) * 1000, 2)
+    with log_step("dispatch_rag_agent", agent="orchestrator", query=query, address=address) as ctx:
+        start = time.perf_counter()
+        with grpc.insecure_channel(address) as channel:
+            stub = agent_pb2_grpc.AgentServiceStub(channel)
+            request = agent_pb2.SendTaskRequest(
+                task_id=task_id, trace_id=trace_id, query=query, context=request_context,
+            )
+            response = stub.SendTask(request, timeout=timeout or settings.GRPC_CALL_TIMEOUT_SECONDS)
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        ctx["output"] = {"state": response.state, "error": response.error or None}
 
     _record_remote_steps("tool_agent_call", "tool_agent", latency_ms, response.usage)
 

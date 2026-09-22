@@ -28,7 +28,7 @@ class Settings(BaseSettings):
 
     # ---- LLM provider selection (multi-provider) ----
     # "openai" | "anthropic" | "local"
-    LLM_PROVIDER: Literal["openai", "anthropic", "local"] = "anthropic"
+    LLM_PROVIDER: Literal["openai", "anthropic", "local", "mlx"] = "anthropic"
     LLM_MODEL: str = "claude-sonnet-4-6"
 
     OPENAI_API_KEY: str | None = None
@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     LOCAL_LLM_BASE_URL: str = "http://localhost:11434/v1"
     LOCAL_LLM_API_KEY: str = "not-needed"
     LOCAL_MODEL_FALLBACK: str = "llama3.1"
+
+    # MLX-LM OpenAI-compatible server on Apple Silicon.
+    # Start with: mlx_lm.server --model <HF-MLX-model> --port 8080
+    MLX_LLM_BASE_URL: str = "http://127.0.0.1:8080/v1"
+    MLX_LLM_API_KEY: str = "not-needed"
+    MLX_MODEL_FALLBACK: str = "mlx-community/DeepSeek-R1-Distill-Qwen-14B-MLX"
 
     # ---- Generation params (used unless a node overrides them) ----
     TEMPERATURE: float = 0.2

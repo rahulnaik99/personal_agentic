@@ -43,7 +43,13 @@ class IngestTextRequest(BaseModel):
 async def ingest_text_endpoint(request: IngestTextRequest):
     triples = [(d.text, d.source, d.category) for d in request.documents]
     return ingest_texts(triples)
-
+    
+@app.get("/stats")
+async def stats():
+    try:
+        return get_ingestion_stats()
+    except Exception as exc:
+        return {"error": str(exc)}
 
 @app.post("/ingest/file")
 async def ingest_file_endpoint(file: UploadFile, category: str = Form(default=UNCATEGORIZED)):

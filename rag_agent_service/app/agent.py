@@ -63,7 +63,7 @@ def classify_category(query: str, model_override: dict | None = None) -> str | N
 
 
 def run_rag_agent(
-    query: str, trace_id: str, forced_category: str | None = None, model_override: dict | None = None,
+    query: str, trace_id: str, forced_category: str | None = None, model_override: dict | None = None, conversation_history: list[dict[str, str]] | None = None,
 ) -> dict:
     """
     forced_category: bypasses classify_category() when the caller already
@@ -109,9 +109,18 @@ def run_rag_agent(
             model_override=override.get("model"),
         )
         context_block = "\n\n---\n\n".join(context_texts) if context_texts else "(no context retrieved)"
+        history = conversation_history or []
+        history_block = "\n".join(
+            f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
+            for m in history[-8:]
+            if m.get("content")
+        )
+        user_content = (
+            f"Conversation history:\n{history_block}\n\n" if history_block else ""
+        ) + f"Context:\n{context_block}\n\nQuestion: {query}"
         messages = [
             SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Context:\n{context_block}\n\nQuestion: {query}"),
+            HumanMessage(content=user_content),
         ]
         response = invoke_and_track(llm, messages, node="rag_generate", agent="rag_agent")
         answer = response.content if isinstance(response.content, str) else str(response.content)
